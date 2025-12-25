@@ -1,6 +1,6 @@
 Load Restaurant Data
 
-"""scala
+~~~scala
 // ================= RESTAURANTS =================
 
 val restaurantsDs = spark.read
@@ -27,4 +27,4 @@ println(
   s"NULL coordinates BEFORE: " +
     restaurantsDs.filter(r => r.lat.isEmpty || r.lng.isEmpty).count()
 )
-"""
+~~~
