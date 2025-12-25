@@ -1,0 +1,166 @@
+package com.github.nmdguerreiro.opencage.geocoder
+
+import org.apache.spark.sql.{SparkSession}
+import org.apache.spark.sql.functions._
+import com.opencagedata.geocoder.OpenCageClient
+import ch.hsr.geohash.GeoHash
+
+import scala.concurrent.Await
+import scala.concurrent.duration._
+
+object RestaurantGeocodingApp {
+
+  case class Restaurant(
+                         id: Long,
+                         franchise_id: Int,
+                         franchise_name: String,
+                         restaurant_franchise_id: Int,
+                         country: String,
+                         city: String,
+                         lat: Option[Double],
+                         lng: Option[Double],
+                         geohash: Option[String]
+                       )
+
+  case class WeatherRow(
+                         lng: Double,
+                         lat: Double,
+                         avg_tmpr_f: Double,
+                         avg_tmpr_c: Double,
+                         wthr_date: String,
+                         year: Int,
+                         month: Int,
+                         day: Int,
+                         geohash: String
+                       )
+
+  def main(args: Array[String]): Unit = {
+
+    val spark = SparkSession.builder()
+      .master("local[*]")
+      .appName("Restaurant Geocoding with Geohash")
+      .getOrCreate()
+
+    import spark.implicits._
+
+    val apiKey = sys.env.getOrElse("OPENCAGE_API_KEY", "YOUR_KEY")
+
+    // ================= RESTAURANTS =================
+
+    val restaurantsDs = spark.read
+      .option("header", "true")
+      .option("inferSchema", "true")
+      .csv("src/main/resources/restaurant_csv")
+      .select(
+        $"id",
+        $"franchise_id",
+        $"franchise_name",
+        $"restaurant_franchise_id",
+        $"country",
+        $"city",
+        $"lat",
+        $"lng"
+      )
+      .as[(Long, Int, String, Int, String, String, Option[Double], Option[Double])]
+      .map {
+        case (id, fid, fname, rfid, country, city, lat, lng) =>
+          Restaurant(id, fid, fname, rfid, country, city, lat, lng, None)
+      }
+
+    println(s"NULL coordinates BEFORE: " +
+      restaurantsDs.filter(r => r.lat.isEmpty || r.lng.isEmpty).count()
+    )
+
+    // ================= GEOCODING =================
+
+    val geocodedDs = restaurantsDs.mapPartitions { partition =>
+      val client = new OpenCageClient(apiKey)
+
+      val result = partition.map { r =>
+        val withCoords =
+          if (r.lat.isEmpty || r.lng.isEmpty) {
+            try {
+              val query = s"${r.franchise_name}, ${r.city}, ${r.country}"
+              val response = Await.result(client.forwardGeocode(query), 5.seconds)
+              val geom = response.results.headOption.flatMap(_.geometry)
+
+              r.copy(
+                lat = geom.map(_.lat.toDouble),
+                lng = geom.map(_.lng.toDouble)
+              )
+            } catch {
+              case _: Exception => r
+            }
+          } else r
+
+        val geohash =
+          for {
+            lat <- withCoords.lat
+            lng <- withCoords.lng
+          } yield GeoHash.withCharacterPrecision(lat, lng, 4).toBase32
+
+        withCoords.copy(geohash = geohash)
+      }.toList.iterator   // материализация
+
+      client.close()
+      result
+    }
+
+    println(s"NULL coordinates AFTER: " +
+      geocodedDs.filter(r => r.lat.isEmpty || r.lng.isEmpty).count()
+    )
+
+    // ================= WEATHER =================
+
+    val weatherAgg = spark.read
+      .parquet("src/main/resources/weather")
+      .withColumn(
+        "geohash",
+        udf((lat: Double, lng: Double) =>
+          GeoHash.withCharacterPrecision(lat, lng, 4).toBase32
+        ).apply(col("lat"), col("lng"))
+      )
+      .groupBy(
+        col("geohash"),
+        col("year"),
+        col("month"),
+        col("day")
+      )
+      .agg(
+        avg("avg_tmpr_c").alias("avg_tmpr_c"),
+        avg("avg_tmpr_f").alias("avg_tmpr_f")
+      )
+
+    // ================= JOIN =================
+
+    val joinedDf =
+      geocodedDs.toDF()
+        .join(
+          weatherAgg,
+          Seq("geohash"),
+          "left"
+        )
+
+    // ================= STORE =================
+    joinedDf
+      .repartition($"year", $"month")   // оптимизация перед записью
+      .write
+      .mode("overwrite")                // идемпотентность
+      .partitionBy("year", "month")     // физическое партиционирование
+      .parquet("src/main/resources/restaurant_weather")
+
+    // ================= VALIDATION =================
+    val writtenDf = spark.read.parquet("src/main/resources/restaurant_weather")
+    writtenDf.show(5, truncate = false)
+    writtenDf.printSchema()
+
+    println("JOIN RESULT:")
+    joinedDf.show(20, truncate = false)
+
+    // Проверка на data multiplication
+    val dup = joinedDf.groupBy("id").count().filter($"count" > 1).count()
+    println(s"Duplicated restaurants after join: $dup")
+
+    spark.stop()
+  }
+}
